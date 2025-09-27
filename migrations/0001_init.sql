@@ -1,28 +1,28 @@
-create table if not exists users (
-  id uuid primary key default gen_random_uuid(),
-  handle text unique not null,
-  created_at timestamptz not null default now()
+CREATE TABLE IF NOT EXISTS users (
+  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  handle     TEXT UNIQUE NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
 );
 
-create table if not exists rooms (
-  id uuid primary key default gen_random_uuid(),
-  type text not null check (type in ('dm','group','geo')),
-  title text,
-  created_at timestamptz not null default now()
+CREATE TABLE IF NOT EXISTS rooms (
+  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  type       TEXT NOT NULL CHECK (type IN ('dm','group','geo')),
+  title      TEXT,
+  created_at timestamptz NOT NULL DEFAULT now()
 );
 
-create table if not exists room_members (
-  room_id uuid not null references rooms(id) on delete cascade,
-  user_id uuid not null references users(id) on delete cascade,
-  primary key (room_id, user_id)
+CREATE TABLE IF NOT EXISTS room_members (
+  room_id uuid NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  PRIMARY KEY (room_id, user_id)
 );
 
-create table if not exists messages (
-  id uuid primary key default gen_random_uuid(),
-  room_id uuid not null references rooms(id) on delete cascade,
-  sender_id uuid not null references users(id),
-  ts timestamptz not null default now(),
-  kind text not null check (kind in ('text','media','ptt')),
-  body text,
-  lang text
+CREATE TABLE IF NOT EXISTS messages (
+  id        uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  room_id   uuid NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+  sender_id uuid NOT NULL REFERENCES users(id),
+  ts        timestamptz NOT NULL DEFAULT now(),
+  kind      TEXT NOT NULL CHECK (kind IN ('text','media','ptt')),
+  body      TEXT,
+  lang      TEXT
 );
