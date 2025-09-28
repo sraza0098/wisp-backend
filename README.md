@@ -58,11 +58,11 @@ Set these variables (defaults are provided):
 export PORT=8081
 export JWT_SECRET=dev-secret-please-change
 
-export DB_HOST=127.0.0.1
-export DB_PORT=5432
+export DB_HOST=
+export DB_PORT=
 export DB_USER=wisp
-export DB_PASSWORD=wisp123
-export DB_NAME=wispdb
+export DB_PASSWORD=
+export DB_NAME=
 
 export REDIS_ADDR=127.0.0.1:6379
 export REDIS_PASSWORD=
