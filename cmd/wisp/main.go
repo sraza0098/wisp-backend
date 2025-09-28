@@ -64,7 +64,7 @@ func main() {
 	registerRoomRoutes(protected, db)
 	registerPresenceRoutes(protected, db, pres)
 	registerMessageRoutes(protected, db, hub)
-
+	RegisterSearchRoutes(protected, db)
 	// WebSocket
 	registerWebsocket(app, hub, pres, jwtSecret)
 
