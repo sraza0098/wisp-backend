@@ -16,6 +16,7 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/gofiber/contrib/websocket"
   	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/gofiber/fiber/v2"
@@ -100,6 +101,49 @@ func (h *wsHub) broadcast(room string, payload []byte) {
 }
 
 
+type Presence struct {
+	rdb      *redis.Client
+	ttl      time.Duration
+	tick     time.Duration
+  }
+  
+  func NewPresence(r *redis.Client, ttl, tick time.Duration) *Presence {
+	return &Presence{rdb: r, ttl: ttl, tick: tick}
+  }
+  
+  // keys:
+  //   pres:user:{userId} = "1" (EX ttl)
+  //   pres:room:{roomId} = Set of userIds (no TTL, cleaned on fetch)
+  //   lastseen:{userId}   = timestamp (string RFC3339) for quick peek (optional)
+  func (p *Presence) heartbeatUser(ctx context.Context, userId string) error {
+	return p.rdb.Set(ctx, "pres:user:"+userId, "1", p.ttl).Err()
+  }
+  func (p *Presence) addToRoom(ctx context.Context, roomId, userId string) error {
+	return p.rdb.SAdd(ctx, "pres:room:"+roomId, userId).Err()
+  }
+  func (p *Presence) removeFromRoom(ctx context.Context, roomId, userId string) error {
+	return p.rdb.SRem(ctx, "pres:room:"+roomId, userId).Err()
+  }
+  func (p *Presence) onlineInRoom(ctx context.Context, roomId string) ([]string, error) {
+	users, err := p.rdb.SMembers(ctx, "pres:room:"+roomId).Result()
+	if err != nil { return nil, err }
+	out := make([]string, 0, len(users))
+	for _, u := range users {
+	  exists, _ := p.rdb.Exists(ctx, "pres:user:"+u).Result()
+	  if exists == 1 {
+		out = append(out, u)
+	  } else {
+		// cleanup stale
+		_ = p.rdb.SRem(ctx, "pres:room:"+roomId, u).Err()
+	  }
+	}
+	return out, nil
+  }
+  func (p *Presence) setLastSeen(ctx context.Context, userId string, t time.Time) {
+	_ = p.rdb.Set(ctx, "lastseen:"+userId, t.Format(time.RFC3339), 0).Err()
+  }
+
+  
 func main() {
 	// --- Config ---
 	dsn := fmt.Sprintf(
@@ -117,6 +161,7 @@ func main() {
 	if err != nil {
 		log.Fatal("sql.Open:", err)
 	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
@@ -125,6 +170,22 @@ func main() {
 	if err := runMigrations(ctx, db); err != nil {
 		log.Fatal("migrate:", err)
 	}
+
+	// --- Redis + Presence ---
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     env("REDIS_ADDR", "127.0.0.1:6379"),
+		Password: env("REDIS_PASSWORD", ""),
+		DB:       0,
+	})
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		log.Fatal("redis ping:", err)
+	}
+	pres := NewPresence(
+		rdb,
+		time.Duration(func() int { if v, _ := strconv.Atoi(env("PRESENCE_TTL_SECONDS","60")); v>0 {return v}; return 60 }())*time.Second,
+		time.Duration(func() int { if v, _ := strconv.Atoi(env("PRESENCE_TICK_SECONDS","20")); v>0 {return v}; return 20 }())*time.Second,
+	)
+
 
 	// --- App + hub ---
 	app := fiber.New()
@@ -464,6 +525,59 @@ func main() {
 		return c.JSON(fiber.Map{"items": items, "nextCursor": nextCursor})
 	})
 
+	// GET /v1/rooms/:roomId/presence
+	protected.Get("/rooms/:roomId/presence", func(c *fiber.Ctx) error {
+		_, err := getUserID(c); if err != nil { return c.SendStatus(fiber.StatusUnauthorized) }
+		roomID := c.Params("roomId")
+		users, err := pres.onlineInRoom(c.Context(), roomID)
+		if err != nil { return c.Status(500).JSON(fiber.Map{"error":"redis error"}) }
+		return c.JSON(fiber.Map{"online": users})
+	})
+
+	// POST /v1/rooms/:roomId/read  { "messageId":"uuid" }
+	protected.Post("/rooms/:roomId/read", func(c *fiber.Ctx) error {
+		userID, err := getUserID(c); if err != nil { return c.SendStatus(fiber.StatusUnauthorized) }
+		roomID := c.Params("roomId")
+		var req struct{ MessageID string `json:"messageId"` }
+		if err := c.BodyParser(&req); err != nil || req.MessageID == "" {
+			return c.Status(400).JSON(fiber.Map{"error":"messageId required"})
+		}
+		_, err = db.ExecContext(c.Context(),
+			`INSERT INTO message_reads(message_id, user_id, room_id)
+			VALUES ($1,$2,$3)
+			ON CONFLICT (message_id,user_id) DO UPDATE SET read_at = EXCLUDED.read_at`,
+			req.MessageID, userID, roomID)
+		if err != nil { return c.Status(500).JSON(fiber.Map{"error":"db error"}) }
+
+		// Optional: if you have hub.broadcast from Day 7, emit a read event
+		// payload, _ := json.Marshal(fiber.Map{
+		//   "type":"read","roomId":roomID,"messageId":req.MessageID,"userId":userID,"at":time.Now().UTC(),
+		// })
+		// hub.broadcast(roomID, payload)
+
+		return c.SendStatus(204)
+	})
+
+	// GET /v1/messages/:messageId/reads
+	protected.Get("/messages/:messageId/reads", func(c *fiber.Ctx) error {
+		_, err := getUserID(c); if err != nil { return c.SendStatus(fiber.StatusUnauthorized) }
+		mid := c.Params("messageId")
+		rows, qerr := db.QueryContext(c.Context(),
+			`SELECT user_id, read_at FROM message_reads WHERE message_id=$1 ORDER BY read_at DESC`, mid)
+		if qerr != nil { return c.Status(500).JSON(fiber.Map{"error":"db error"}) }
+		defer rows.Close()
+		type rr struct{ UserID string `json:"userId"`; ReadAt time.Time `json:"readAt"` }
+		out := []rr{}
+		for rows.Next() {
+			var x rr
+			if err := rows.Scan(&x.UserID, &x.ReadAt); err != nil {
+				return c.Status(500).JSON(fiber.Map{"error":"scan"})
+			}
+			out = append(out, x)
+		}
+		return c.JSON(out)
+	})
+
 	// ---------- WebSocket endpoint: /ws?roomId=... ----------
 	// Clients connect with a valid JWT in Sec-WebSocket-Protocol (subprotocol) as "Bearer <token>"
 	app.Get("/ws", websocket.New(func(c *websocket.Conn) {
@@ -486,9 +600,37 @@ func main() {
 		claims, ok := tok.Claims.(jwt.MapClaims); if !ok { _ = c.Close(); return }
 		uid, _ := claims["sub"].(string); if uid == "" { _ = c.Close(); return }
 
+		// --- PRESENCE: mark online + join room set ---
+		// immediately mark user online and add to this room's online set
+		_ = pres.heartbeatUser(context.Background(), uid)
+		_ = pres.addToRoom(context.Background(), roomID, uid)
+
+		// keep user online while socket is open (heartbeat every pres.tick)
+		stop := make(chan struct{})
+		go func() {
+			t := time.NewTicker(pres.tick)
+			defer t.Stop()
+			for {
+				select {
+				case <-t.C:
+					_ = pres.heartbeatUser(context.Background(), uid)
+				case <-stop:
+					return
+				}
+			}
+		}()
+		// --------------------------------------------
 		client := &wsClient{conn: c, send: make(chan []byte, 8), user: uid}
 		hub.add(roomID, client)
-		defer func() { hub.remove(roomID, client); close(client.send) }()
+		defer func() {
+			// --- PRESENCE: cleanup on close ---
+			close(stop)
+			_ = pres.removeFromRoom(context.Background(), roomID, uid)
+			pres.setLastSeen(context.Background(), uid, time.Now().UTC())
+			// ----------------------------------
+			hub.remove(roomID, client)
+			close(client.send)
+		}()
 
 		// writer
 		go func() {
@@ -522,6 +664,7 @@ func main() {
 		JOIN users u ON u.id = m.sender_id
 		ORDER BY m.created_at DESC LIMIT $2`, userID, limit)
 	if qerr != nil { return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error":"db error"}) }
+
 	defer rows.Close()
 
 	type msg struct {
