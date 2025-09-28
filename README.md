@@ -1,5 +1,3 @@
-Here’s a `README.md` you can drop into the root of your repo. It explains what your app is, how to run it locally, and how to build/deploy with Docker & Makefile. I kept it straightforward but clear.
-
 ---
 
 ```markdown
