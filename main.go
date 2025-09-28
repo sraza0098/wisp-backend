@@ -10,7 +10,12 @@ import (
 	"net/http"
 	"os"
 	"time"
+	"strconv"
+    "strings"
+	"sort"
+	"errors"
 
+  	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/gofiber/fiber/v2"
 	jwtware "github.com/gofiber/jwt/v3"
 	"github.com/golang-jwt/jwt/v5"
@@ -30,24 +35,28 @@ func env(k, def string) string {
 }
 
 func runMigrations(ctx context.Context, db *sql.DB) error {
-	// pgcrypto gives us gen_random_uuid()
-	if _, err := db.ExecContext(ctx, `CREATE EXTENSION IF NOT EXISTS pgcrypto;`); err != nil {
-		return fmt.Errorf("enable pgcrypto: %w", err)
-	}
-	entries, err := migrationFS.ReadDir("migrations")
-	if err != nil {
-		return fmt.Errorf("read migrations: %w", err)
-	}
-	for _, e := range entries {
-		sqlb, err := migrationFS.ReadFile("migrations/" + e.Name())
-		if err != nil {
-			return fmt.Errorf("read %s: %w", e.Name(), err)
-		}
-		if _, err := db.ExecContext(ctx, string(sqlb)); err != nil {
-			return fmt.Errorf("apply %s: %w", e.Name(), err)
-		}
-	}
-	return nil
+    if _, err := db.ExecContext(ctx, `CREATE EXTENSION IF NOT EXISTS pgcrypto;`); err != nil {
+        return fmt.Errorf("enable pgcrypto: %w", err)
+    }
+    entries, err := migrationFS.ReadDir("migrations")
+    if err != nil {
+        return fmt.Errorf("read migrations: %w", err)
+    }
+
+    // 🔑 sort so 0001, 0002, 0003 apply in order
+    sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+
+    for _, e := range entries {
+        sqlb, err := migrationFS.ReadFile("migrations/" + e.Name())
+        if err != nil {
+            return fmt.Errorf("read %s: %w", e.Name(), err)
+        }
+        if _, err := db.ExecContext(ctx, string(sqlb)); err != nil {
+            return fmt.Errorf("migrate:apply %s: %w", e.Name(), err)
+        }
+		log.Println(" -", e.Name())
+    }
+    return nil
 }
 
 func main() {
@@ -119,10 +128,16 @@ func main() {
 		}
 		// insert (username unique)
 		_, err = db.ExecContext(c.Context(),
-			`INSERT INTO users (username, password_hash) VALUES ($1, $2)`, req.Username, string(hash))
+			`INSERT INTO users (username, password_hash) VALUES ($1, $2)`,
+			req.Username, string(hash),
+		)
 		if err != nil {
-			// unique violation or other error
-			return c.Status(http.StatusConflict).JSON(fiber.Map{"error": "username exists or db error"})
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error":"username exists"})
+			}
+			log.Printf("signup db error: %v", err) // <-- keep this while debugging
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error":"db error"})
 		}
 		return c.SendStatus(http.StatusCreated)
 	})
@@ -165,67 +180,237 @@ func main() {
 
 	// --- Protected API group (JWT required) ---
 	protected := app.Group("/v1",
-		jwtware.New(jwtware.Config{
-			SigningKey:   jwtSecret,
-			ContextKey:   "jwt", // c.Locals("jwt")
-			ErrorHandler: func(c *fiber.Ctx, err error) error { return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"}) },
-		}),
+	jwtware.New(jwtware.Config{
+		SigningKey: jwtSecret,
+		ContextKey: "jwt",
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+		},
+	}),
 	)
 
-	// Create room (protected)
-	protected.Post("/rooms", func(c *fiber.Ctx) error {
-		var req struct {
-			Title string `json:"title"`
-			Type  string `json:"type"` // dm | group | geo
+	// helper: get user ID (sub) from JWT
+	// helper: get user ID (sub) from Authorization header (version-agnostic)
+	getUserID := func(c *fiber.Ctx) (string, error) {
+		auth := c.Get("Authorization")
+		if auth == "" {
+			// Some clients send lowercase; headers are case-insensitive, but just in case:
+			auth = c.Get("authorization")
 		}
-		if err := c.BodyParser(&req); err != nil || req.Type == "" {
-			return c.Status(http.StatusBadRequest).SendString("bad json")
+		const p = "Bearer "
+		if !strings.HasPrefix(auth, p) {
+			return "", fmt.Errorf("no bearer")
 		}
-		if req.Title == "" {
-			req.Title = req.Type
-		}
-		_, err := db.ExecContext(c.Context(),
-			`INSERT INTO rooms(type, title) VALUES ($1, $2)`, req.Type, req.Title)
-		if err != nil {
-			return c.Status(http.StatusInternalServerError).SendString("db error")
-		}
-		return c.SendStatus(http.StatusCreated)
-	})
+		tokenStr := strings.TrimSpace(auth[len(p):])
 
-	// List rooms (protected)
-	protected.Get("/rooms", func(c *fiber.Ctx) error {
-		rows, err := db.QueryContext(c.Context(),
-			`SELECT id, type, title, created_at FROM rooms ORDER BY created_at DESC LIMIT 50`)
-		if err != nil {
-			return c.Status(http.StatusInternalServerError).SendString("db error")
-		}
-		defer rows.Close()
-		type room struct {
-			ID        string    `json:"id"`
-			Type      string    `json:"type"`
-			Title     string    `json:"title"`
-			CreatedAt time.Time `json:"createdAt"`
-		}
-		var out []room
-		for rows.Next() {
-			var r room
-			if err := rows.Scan(&r.ID, &r.Type, &r.Title, &r.CreatedAt); err != nil {
-				return c.Status(http.StatusInternalServerError).SendString("scan error")
+		// Parse & validate using our HS256 secret
+		tok, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+			if t.Method.Alg() != jwt.SigningMethodHS256.Alg() {
+				return nil, fmt.Errorf("unexpected alg")
 			}
-			out = append(out, r)
+			return []byte(env("JWT_SECRET", "dev-secret-please-change")), nil
+		})
+		if err != nil || !tok.Valid {
+			return "", fmt.Errorf("invalid token")
 		}
-		return c.JSON(out)
+		claims, ok := tok.Claims.(jwt.MapClaims)
+		if !ok {
+			return "", fmt.Errorf("bad claims")
+		}
+		sub, _ := claims["sub"].(string)
+		if sub == "" {
+			return "", fmt.Errorf("no sub")
+		}
+		return sub, nil
+	}
+
+
+	// --- Day 6 routes (MUST be before Listen) ---
+
+	// Create room
+	protected.Post("/rooms", func(c *fiber.Ctx) error {
+	var req struct {
+		Title string `json:"title"`
+		Type  string `json:"type"` // dm | group | geo
+	}
+	if err := c.BodyParser(&req); err != nil || req.Type == "" {
+		return c.Status(http.StatusBadRequest).SendString("bad json")
+	}
+	if req.Title == "" { req.Title = req.Type }
+	if _, err := db.ExecContext(c.Context(),
+		`INSERT INTO rooms(type, title) VALUES ($1,$2)`, req.Type, req.Title); err != nil {
+		return c.Status(http.StatusInternalServerError).SendString("db error")
+	}
+	return c.SendStatus(http.StatusCreated)
 	})
 
-	// Route dump for debugging
+	// List rooms
+	protected.Get("/rooms", func(c *fiber.Ctx) error {
+	rows, err := db.QueryContext(c.Context(),
+		`SELECT id, type, title, created_at FROM rooms ORDER BY created_at DESC LIMIT 50`)
+	if err != nil { return c.Status(http.StatusInternalServerError).SendString("db error") }
+	defer rows.Close()
+	type room struct {
+		ID string `json:"id"`; Type string `json:"type"`; Title string `json:"title"`; CreatedAt time.Time `json:"createdAt"`
+	}
+	var out []room
+	for rows.Next() {
+		var r room
+		if err := rows.Scan(&r.ID, &r.Type, &r.Title, &r.CreatedAt); err != nil {
+			return c.Status(http.StatusInternalServerError).SendString("scan error")
+		}
+		out = append(out, r)
+	}
+	return c.JSON(out)
+	})
+
+	// Join room (idempotent)
+	protected.Post("/rooms/:roomId/join", func(c *fiber.Ctx) error {
+	userID, err := getUserID(c)
+	if err != nil { return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error":"unauthorized"}) }
+	roomID := c.Params("roomId")
+	if roomID == "" { return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error":"missing roomId"}) }
+
+	var exists bool
+	if err := db.QueryRowContext(c.Context(),
+		`SELECT EXISTS (SELECT 1 FROM rooms WHERE id=$1)`, roomID).Scan(&exists); err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error":"db error"})
+	}
+	if !exists { return c.Status(http.StatusNotFound).JSON(fiber.Map{"error":"room not found"}) }
+
+	if _, err := db.ExecContext(c.Context(),
+		`INSERT INTO room_members(room_id,user_id) VALUES ($1,$2)
+		ON CONFLICT (room_id,user_id) DO NOTHING`, roomID, userID); err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error":"db error"})
+	}
+	return c.SendStatus(http.StatusNoContent)
+	})
+
+	// Send message
+	protected.Post("/rooms/:roomId/messages", func(c *fiber.Ctx) error {
+	userID, err := getUserID(c)
+	if err != nil { return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error":"unauthorized"}) }
+	roomID := c.Params("roomId")
+	if roomID == "" { return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error":"missing roomId"}) }
+
+	var member bool
+	if err := db.QueryRowContext(c.Context(),
+		`SELECT EXISTS (SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2)`,
+		roomID, userID).Scan(&member); err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error":"db error"})
+	}
+	if !member { return c.Status(http.StatusForbidden).JSON(fiber.Map{"error":"join room first"}) }
+
+	var req struct{ Body, Kind string }
+	if err := c.BodyParser(&req); err != nil || strings.TrimSpace(req.Body) == "" {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error":"body required"})
+	}
+	if req.Kind == "" { req.Kind = "text" }
+
+	if _, err := db.ExecContext(c.Context(),
+		`INSERT INTO messages(room_id, sender_id, kind, body) VALUES ($1,$2,$3,$4)`,
+		roomID, userID, req.Kind, req.Body); err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error":"db error"})
+	}
+	return c.SendStatus(http.StatusCreated)
+	})
+
+	// List messages in a room
+	protected.Get("/rooms/:roomId/messages", func(c *fiber.Ctx) error {
+	userID, err := getUserID(c)
+	if err != nil { return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error":"unauthorized"}) }
+	roomID := c.Params("roomId")
+	if roomID == "" { return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error":"missing roomId"}) }
+
+	var member bool
+	if err := db.QueryRowContext(c.Context(),
+		`SELECT EXISTS (SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2)`,
+		roomID, userID).Scan(&member); err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error":"db error"})
+	}
+	if !member { return c.Status(http.StatusForbidden).JSON(fiber.Map{"error":"join room first"}) }
+
+	afterStr := c.Query("after", "")
+	limit := 50
+	if v := c.Query("limit", ""); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 200 { limit = n }
+	}
+
+	var rows *sql.Rows; var qerr error
+	if afterStr != "" {
+		t, err := time.Parse(time.RFC3339, afterStr)
+		if err != nil { return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error":"bad after (RFC3339)"}) }
+		rows, qerr = db.QueryContext(c.Context(),
+			`SELECT m.id, m.room_id, m.sender_id, u.username, m.kind, m.body, m.created_at
+			FROM messages m JOIN users u ON u.id = m.sender_id
+			WHERE m.room_id=$1 AND m.created_at > $2
+			ORDER BY m.created_at DESC LIMIT $3`, roomID, t, limit)
+	} else {
+		rows, qerr = db.QueryContext(c.Context(),
+			`SELECT m.id, m.room_id, m.sender_id, u.username, m.kind, m.body, m.created_at
+			FROM messages m JOIN users u ON u.id = m.sender_id
+			WHERE m.room_id=$1
+			ORDER BY m.created_at DESC LIMIT $2`, roomID, limit)
+	}
+	if qerr != nil { return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error":"db error"}) }
+	defer rows.Close()
+
+	type msg struct {
+		ID, RoomID, SenderID, Sender, Kind, Body string
+		CreatedAt time.Time
+	}
+	var out []msg
+	for rows.Next() {
+		var m msg
+		if err := rows.Scan(&m.ID, &m.RoomID, &m.SenderID, &m.Sender, &m.Kind, &m.Body, &m.CreatedAt); err != nil {
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error":"scan error"})
+		}
+		out = append(out, m)
+	}
+	return c.JSON(out)
+	})
+
+	// Recent messages for the user
+	protected.Get("/messages/recent", func(c *fiber.Ctx) error {
+	userID, err := getUserID(c)
+	if err != nil { return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error":"unauthorized"}) }
+	limit := 50
+	if v := c.Query("limit", ""); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 200 { limit = n }
+	}
+	rows, qerr := db.QueryContext(c.Context(),
+		`SELECT m.id, m.room_id, m.sender_id, u.username, m.kind, m.body, m.created_at
+		FROM messages m
+		JOIN room_members rm ON rm.room_id = m.room_id AND rm.user_id = $1
+		JOIN users u ON u.id = m.sender_id
+		ORDER BY m.created_at DESC LIMIT $2`, userID, limit)
+	if qerr != nil { return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error":"db error"}) }
+	defer rows.Close()
+
+	type msg struct {
+		ID, RoomID, SenderID, Sender, Kind, Body string
+		CreatedAt time.Time
+	}
+	var out []msg
+	for rows.Next() {
+		var m msg
+		if err := rows.Scan(&m.ID, &m.RoomID, &m.SenderID, &m.Sender, &m.Kind, &m.Body, &m.CreatedAt); err != nil {
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error":"scan error"})
+		}
+		out = append(out, m)
+	}
+	return c.JSON(out)
+	})
+
+	// route dump (dev)
 	go func() {
-		time.Sleep(200 * time.Millisecond)
-		routes := app.GetRoutes()
-		b, _ := json.MarshalIndent(routes, "", "  ")
-		log.Printf("ROUTES:\n%s\n", string(b))
+	time.Sleep(200 * time.Millisecond)
+	b, _ := json.MarshalIndent(app.GetRoutes(), "", "  ")
+	log.Printf("ROUTES:\n%s\n", string(b))
 	}()
 	app.Get("/__routes", func(c *fiber.Ctx) error { return c.JSON(app.GetRoutes()) })
 
-	// Serve
+	// ---- LISTEN LAST ----
 	log.Fatal(app.Listen(":" + env("PORT", "8080")))
+
 }
