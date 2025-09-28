@@ -14,7 +14,9 @@ import (
     "strings"
 	"sort"
 	"errors"
+	"sync"
 
+	"github.com/gofiber/contrib/websocket"
   	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/gofiber/fiber/v2"
 	jwtware "github.com/gofiber/jwt/v3"
@@ -59,6 +61,45 @@ func runMigrations(ctx context.Context, db *sql.DB) error {
     return nil
 }
 
+type wsClient struct {
+    conn *websocket.Conn
+    send chan []byte
+    user string
+}
+
+type wsHub struct {
+    mu    sync.RWMutex
+    rooms map[string]map[*wsClient]struct{}
+}
+type typingState struct {
+    mu    sync.Mutex
+    byRoom map[string]map[string]time.Time // roomID -> username -> expiresAt
+}
+var typing = typingState{byRoom: map[string]map[string]time.Time{}}
+
+func newHub() *wsHub {
+    return &wsHub{rooms: make(map[string]map[*wsClient]struct{})}
+}
+func (h *wsHub) add(room string, c *wsClient) {
+    h.mu.Lock(); defer h.mu.Unlock()
+    if h.rooms[room] == nil { h.rooms[room] = make(map[*wsClient]struct{}) }
+    h.rooms[room][c] = struct{}{}
+}
+func (h *wsHub) remove(room string, c *wsClient) {
+    h.mu.Lock(); defer h.mu.Unlock()
+    if m, ok := h.rooms[room]; ok {
+        delete(m, c)
+        if len(m) == 0 { delete(h.rooms, room) }
+    }
+}
+func (h *wsHub) broadcast(room string, payload []byte) {
+    h.mu.RLock(); defer h.mu.RUnlock()
+    for c := range h.rooms[room] {
+        select { case c.send <- payload: default: /* drop if slow */ }
+    }
+}
+
+
 func main() {
 	// --- Config ---
 	dsn := fmt.Sprintf(
@@ -85,8 +126,9 @@ func main() {
 		log.Fatal("migrate:", err)
 	}
 
-	// --- App ---
+	// --- App + hub ---
 	app := fiber.New()
+	hub := newHub()
 
 	// Basic endpoints
 	app.Get("/", func(c *fiber.Ctx) error {
@@ -286,6 +328,46 @@ func main() {
 	return c.SendStatus(http.StatusNoContent)
 	})
 
+	protected.Post("/rooms/:roomId/typing", func(c *fiber.Ctx) error {
+		userID, err := getUserID(c); if err != nil { return c.SendStatus(401) }
+	
+		// look up username for display (optional but nicer)
+		var username string
+		_ = db.QueryRowContext(c.Context(),
+			`SELECT username FROM users WHERE id=$1`, userID).Scan(&username)
+		if username == "" { username = userID } // fallback
+	
+		roomID := c.Params("roomId")
+		if roomID == "" { return c.SendStatus(400) }
+	
+		typing.mu.Lock()
+		if typing.byRoom[roomID] == nil { typing.byRoom[roomID] = map[string]time.Time{} }
+		typing.byRoom[roomID][username] = time.Now().Add(3 * time.Second) // expires in 3s
+		typing.mu.Unlock()
+	
+		// (optional) also broadcast to WS listeners
+		// payload, _ := json.Marshal(fiber.Map{"type":"typing","roomId":roomID,"user":username,"ts":time.Now().UTC()})
+		// hub.broadcast(roomID, payload)
+	
+		return c.SendStatus(204)
+	})
+	
+	protected.Get("/rooms/:roomId/typing", func(c *fiber.Ctx) error {
+		roomID := c.Params("roomId")
+		if roomID == "" { return c.SendStatus(400) }
+	
+		now := time.Now()
+		typing.mu.Lock()
+		m := typing.byRoom[roomID]
+		out := []string{}
+		for u, exp := range m {
+			if now.Before(exp) { out = append(out, u) } else { delete(m, u) }
+		}
+		typing.mu.Unlock()
+	
+		return c.JSON(out)
+	})
+	
 	// Send message
 	protected.Post("/rooms/:roomId/messages", func(c *fiber.Ctx) error {
 	userID, err := getUserID(c)
@@ -312,63 +394,118 @@ func main() {
 		roomID, userID, req.Kind, req.Body); err != nil {
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error":"db error"})
 	}
+	payload, _ := json.Marshal(fiber.Map{
+		"type": "message",
+		"roomId": roomID,
+		"from":  userID,
+		"kind":  req.Kind,
+		"body":  req.Body,
+		"ts":    time.Now().UTC(),
+	})
+	hub.broadcast(roomID, payload)
+	
 	return c.SendStatus(http.StatusCreated)
 	})
 
 	// List messages in a room
 	protected.Get("/rooms/:roomId/messages", func(c *fiber.Ctx) error {
-	userID, err := getUserID(c)
-	if err != nil { return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error":"unauthorized"}) }
-	roomID := c.Params("roomId")
-	if roomID == "" { return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error":"missing roomId"}) }
+		userID, err := getUserID(c); if err != nil { return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error":"unauthorized"}) }
+		roomID := c.Params("roomId"); if roomID == "" { return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error":"missing roomId"}) }
 
-	var member bool
-	if err := db.QueryRowContext(c.Context(),
-		`SELECT EXISTS (SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2)`,
-		roomID, userID).Scan(&member); err != nil {
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error":"db error"})
-	}
-	if !member { return c.Status(http.StatusForbidden).JSON(fiber.Map{"error":"join room first"}) }
-
-	afterStr := c.Query("after", "")
-	limit := 50
-	if v := c.Query("limit", ""); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 200 { limit = n }
-	}
-
-	var rows *sql.Rows; var qerr error
-	if afterStr != "" {
-		t, err := time.Parse(time.RFC3339, afterStr)
-		if err != nil { return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error":"bad after (RFC3339)"}) }
-		rows, qerr = db.QueryContext(c.Context(),
-			`SELECT m.id, m.room_id, m.sender_id, u.username, m.kind, m.body, m.created_at
-			FROM messages m JOIN users u ON u.id = m.sender_id
-			WHERE m.room_id=$1 AND m.created_at > $2
-			ORDER BY m.created_at DESC LIMIT $3`, roomID, t, limit)
-	} else {
-		rows, qerr = db.QueryContext(c.Context(),
-			`SELECT m.id, m.room_id, m.sender_id, u.username, m.kind, m.body, m.created_at
-			FROM messages m JOIN users u ON u.id = m.sender_id
-			WHERE m.room_id=$1
-			ORDER BY m.created_at DESC LIMIT $2`, roomID, limit)
-	}
-	if qerr != nil { return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error":"db error"}) }
-	defer rows.Close()
-
-	type msg struct {
-		ID, RoomID, SenderID, Sender, Kind, Body string
-		CreatedAt time.Time
-	}
-	var out []msg
-	for rows.Next() {
-		var m msg
-		if err := rows.Scan(&m.ID, &m.RoomID, &m.SenderID, &m.Sender, &m.Kind, &m.Body, &m.CreatedAt); err != nil {
-			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error":"scan error"})
+		var member bool
+		if err := db.QueryRowContext(c.Context(),
+			`SELECT EXISTS (SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2)`,
+			roomID, userID).Scan(&member); err != nil {
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error":"db error"})
 		}
-		out = append(out, m)
-	}
-	return c.JSON(out)
+		if !member { return c.Status(http.StatusForbidden).JSON(fiber.Map{"error":"join room first"}) }
+
+		limit := 50
+		if v := c.Query("limit", ""); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 200 { limit = n }
+		}
+		beforeStr := c.Query("before", "")
+
+		var rows *sql.Rows; var qerr error
+		if beforeStr != "" {
+			t, err := time.Parse(time.RFC3339, beforeStr)
+			if err != nil { return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error":"bad before (RFC3339)"}) }
+			rows, qerr = db.QueryContext(c.Context(),
+				`SELECT m.id, m.room_id, m.sender_id, u.username, m.kind, m.body, m.created_at
+				   FROM messages m JOIN users u ON u.id = m.sender_id
+				  WHERE m.room_id=$1 AND m.created_at < $2
+				  ORDER BY m.created_at DESC, m.id DESC LIMIT $3`, roomID, t, limit+1)
+		} else {
+			rows, qerr = db.QueryContext(c.Context(),
+				`SELECT m.id, m.room_id, m.sender_id, u.username, m.kind, m.body, m.created_at
+				   FROM messages m JOIN users u ON u.id = m.sender_id
+				  WHERE m.room_id=$1
+				  ORDER BY m.created_at DESC, m.id DESC LIMIT $2`, roomID, limit+1)
+		}
+		if qerr != nil { return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error":"db error"}) }
+		defer rows.Close()
+
+		type msg struct{ ID, RoomID, SenderID, Sender, Kind, Body string; CreatedAt time.Time }
+		var items []msg
+		for rows.Next() {
+			var m msg
+			if err := rows.Scan(&m.ID, &m.RoomID, &m.SenderID, &m.Sender, &m.Kind, &m.Body, &m.CreatedAt); err != nil {
+				return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error":"scan error"})
+			}
+			items = append(items, m)
+		}
+
+		var nextCursor *string
+		if len(items) > limit {
+			items = items[:limit]
+			nc := items[len(items)-1].CreatedAt.UTC().Format(time.RFC3339)
+			nextCursor = &nc
+		}
+		return c.JSON(fiber.Map{"items": items, "nextCursor": nextCursor})
 	})
+
+	// ---------- WebSocket endpoint: /ws?roomId=... ----------
+	// Clients connect with a valid JWT in Sec-WebSocket-Protocol (subprotocol) as "Bearer <token>"
+	app.Get("/ws", websocket.New(func(c *websocket.Conn) {
+		// very small auth shim for dev: token in "Authorization" header or query
+		roomID := c.Query("roomId")
+		if roomID == "" { _ = c.Close(); return }
+
+		tokenStr := c.Cookies("token")
+		if tokenStr == "" {
+			// try query param or header
+			tokenStr = strings.TrimSpace(strings.TrimPrefix(c.Query("token"), "Bearer "))
+			if tokenStr == "" {
+				tokenStr = strings.TrimSpace(strings.TrimPrefix(c.Headers("Authorization"), "Bearer "))
+			}
+		}
+		tok, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+			return jwtSecret, nil
+		})
+		if err != nil || !tok.Valid { _ = c.Close(); return }
+		claims, ok := tok.Claims.(jwt.MapClaims); if !ok { _ = c.Close(); return }
+		uid, _ := claims["sub"].(string); if uid == "" { _ = c.Close(); return }
+
+		client := &wsClient{conn: c, send: make(chan []byte, 8), user: uid}
+		hub.add(roomID, client)
+		defer func() { hub.remove(roomID, client); close(client.send) }()
+
+		// writer
+		go func() {
+			for msg := range client.send {
+				if err := c.WriteMessage(websocket.TextMessage, msg); err != nil {
+					return
+				}
+			}
+		}()
+
+		// reader (ignore messages from client for now)
+		for {
+			if _, _, err := c.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
 
 	// Recent messages for the user
 	protected.Get("/messages/recent", func(c *fiber.Ctx) error {
